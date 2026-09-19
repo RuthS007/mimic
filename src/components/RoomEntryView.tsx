@@ -10,7 +10,9 @@ import {
   Radio,
   Volume2,
   Gamepad2,
+  Server,
 } from "lucide-react";
+import { getApiUrl, getServerUrl } from "../services/serverConfig";
 
 interface RoomEntryViewProps {
   onJoinRoom: (roomCode: string, playerName: string, avatar: string) => Promise<void>;
@@ -58,7 +60,7 @@ export const RoomEntryView: React.FC<RoomEntryViewProps> = ({
 
   // Check server health on mount
   useEffect(() => {
-    fetch("/api/health")
+    fetch(getApiUrl("/api/health"))
       .then((res) => res.json())
       .then(() => setServerOnline(true))
       .catch(() => setServerOnline(false));

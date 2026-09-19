@@ -220,8 +220,16 @@ export class RoomManager {
   private roomSockets: Map<string, Set<WebSocket>> = new Map();
   private socketPlayerMap: Map<WebSocket, { roomCode: string; playerId: string }> = new Map();
   private roomTimers: Map<string, any> = new Map();
+  private ioServer: any = null;
 
   constructor(private getAiClient: () => GoogleGenAI | null) {}
+
+  /**
+   * Connect Socket.io server instance for multi-transport room broadcasting
+   */
+  setSocketIOServer(io: any): void {
+    this.ioServer = io;
+  }
 
   /**
    * Helper: Normalize room code to uppercase without leading/trailing spaces
@@ -386,23 +394,39 @@ export class RoomManager {
     const room = this.rooms.get(code);
     if (!room) return;
 
-    const sockets = this.roomSockets.get(code);
-    if (!sockets || sockets.size === 0) return;
+    const cloned = this.cloneState(room);
 
-    const payload = JSON.stringify({
-      type: "ROOM_STATE",
-      state: this.cloneState(room),
-    });
-
-    sockets.forEach((ws) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(payload);
-        } catch (err) {
-          console.warn("Failed to send WebSocket message:", err);
-        }
+    // 1. Broadcast to Socket.io room subscribers
+    if (this.ioServer) {
+      try {
+        this.ioServer.to(code).emit("ROOM_STATE", {
+          type: "ROOM_STATE",
+          state: cloned,
+        });
+        this.ioServer.to(code).emit("room_state", cloned);
+      } catch (err) {
+        console.warn("Failed to broadcast to Socket.io room:", err);
       }
-    });
+    }
+
+    // 2. Broadcast to raw WebSocket connections
+    const sockets = this.roomSockets.get(code);
+    if (sockets && sockets.size > 0) {
+      const payload = JSON.stringify({
+        type: "ROOM_STATE",
+        state: cloned,
+      });
+
+      sockets.forEach((ws) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(payload);
+          } catch (err) {
+            console.warn("Failed to send WebSocket message:", err);
+          }
+        }
+      });
+    }
   }
 
   /**

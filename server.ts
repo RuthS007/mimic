@@ -1,6 +1,9 @@
 import express from "express";
 import http from "http";
 import path from "path";
+import fs from "fs";
+import cors from "cors";
+import { Server as SocketIOServer } from "socket.io";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import { WebSocket, WebSocketServer } from "ws";
@@ -10,7 +13,40 @@ import { RoomManager } from "./server/rooms";
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+
+// Bind PORT dynamically for Render deployment, while preserving port 3000 in AI Studio
+const PORT = process.env.RENDER
+  ? parseInt(process.env.PORT || "3000", 10)
+  : process.env.PORT && process.env.PORT !== "8080"
+  ? parseInt(process.env.PORT, 10)
+  : 3000;
+
+// Dynamic CORS configuration for Vercel frontend / multi-origin party play
+const configuredFrontendUrl = process.env.FRONTEND_URL
+  ? process.env.FRONTEND_URL.trim().replace(/\/+$/, "")
+  : "";
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (mobile apps, curl, server-to-server, same-origin)
+      if (!origin) return callback(null, true);
+
+      // If a specific FRONTEND_URL is set, prioritize matching it or Vercel previews
+      if (configuredFrontendUrl) {
+        if (origin === configuredFrontendUrl || origin.endsWith(".vercel.app")) {
+          return callback(null, true);
+        }
+      }
+
+      // Permissive dynamic origin fallback for cross-device multiplayer party game
+      return callback(null, true);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 
 app.use(express.json({ limit: "15mb" }));
 app.use(express.urlencoded({ extended: true }));
@@ -236,6 +272,60 @@ Write a witty, punchy, funny 1-2 sentence critique that directly roasts or prais
 
 async function startServer() {
   const server = http.createServer(app);
+
+  // Initialize Socket.io server with CORS support for Vercel / multi-origin clients
+  const io = new SocketIOServer(server, {
+    path: "/socket.io/",
+    cors: {
+      origin: (origin, callback) => {
+        callback(null, true);
+      },
+      methods: ["GET", "POST"],
+      credentials: true,
+    },
+    transports: ["websocket", "polling"],
+  });
+
+  roomManager.setSocketIOServer(io);
+
+  io.on("connection", (socket) => {
+    socket.on("join", ({ roomCode, playerId }: { roomCode: string; playerId: string }) => {
+      if (roomCode) {
+        const cleanCode = roomCode.trim().toUpperCase();
+        socket.join(cleanCode);
+        const room = roomManager.getRoom(cleanCode);
+        if (room) {
+          socket.emit("ROOM_STATE", { type: "ROOM_STATE", state: room });
+          socket.emit("room_state", room);
+        }
+      }
+    });
+
+    socket.on(
+      "action",
+      async ({
+        roomCode,
+        playerId,
+        actionType,
+        payload,
+      }: {
+        roomCode: string;
+        playerId: string;
+        actionType: string;
+        payload: any;
+      }) => {
+        if (roomCode && actionType) {
+          await roomManager.handleAction(roomCode, playerId, actionType, payload);
+        }
+      }
+    );
+
+    socket.on("ping", () => {
+      socket.emit("pong");
+    });
+  });
+
+  // Native WebSocketServer for low-overhead client fallback
   const wss = new WebSocketServer({ server, path: "/ws" });
 
   wss.on("connection", (ws: WebSocket, req) => {
@@ -299,9 +389,27 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
+    const indexFile = path.join(distPath, "index.html");
+    if (fs.existsSync(distPath)) {
+      app.use(express.static(distPath));
+    }
     app.get("*", (_req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
+      if (fs.existsSync(indexFile)) {
+        res.sendFile(indexFile);
+      } else {
+        res.json({
+          status: "online",
+          service: "Echo Match Game Backend",
+          version: "1.0.0",
+          endpoints: {
+            health: "/api/health",
+            createRoom: "POST /api/rooms/create",
+            joinRoom: "POST /api/rooms/join",
+            socketIO: "/socket.io/",
+            webSocket: "/ws",
+          },
+        });
+      }
     });
   }
 

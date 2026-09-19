@@ -13,6 +13,7 @@
 
 import Meyda from "meyda";
 import { AudioClip, AudioRecording, SimilarityResult } from "../types";
+import { getApiUrl } from "./serverConfig";
 
 export class AudioComparer {
   /**
@@ -82,7 +83,7 @@ export class AudioComparer {
     mimicRecording: AudioRecording
   ): Promise<SimilarityResult> {
     try {
-      const response = await fetch("/api/compare-audio", {
+      const response = await fetch(getApiUrl("/api/compare-audio"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

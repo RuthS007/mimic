@@ -18,6 +18,9 @@ import {
 } from "../types";
 import { AudioComparer } from "./AudioComparer";
 import { AudioClipManager } from "./AudioClipManager";
+import { getApiUrl, getWsUrl } from "./serverConfig";
+import { getSocket } from "./socketClient";
+import type { Socket } from "socket.io-client";
 
 export type StateListener = (state: RoomState | null) => void;
 
@@ -74,6 +77,7 @@ export class GameStateHandler {
   private currentPlayerId: string = "";
   private listeners: Set<StateListener> = new Set();
   private ws: WebSocket | null = null;
+  private socketIo: Socket | null = null;
   private pollInterval: any = null;
   private isConnecting: boolean = false;
   private pingInterval: any = null;
@@ -148,7 +152,7 @@ export class GameStateHandler {
     hostAvatar: string,
     customRoomCode?: string
   ): Promise<RoomState> {
-    const res = await fetch("/api/rooms/create", {
+    const res = await fetch(getApiUrl("/api/rooms/create"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -169,7 +173,7 @@ export class GameStateHandler {
     this.saveSession(data.roomState.roomCode, data.player.id);
     this.notify();
 
-    this.connectWebSocket(data.roomState.roomCode, data.player.id);
+    this.connectSockets(data.roomState.roomCode, data.player.id);
     this.startPolling(data.roomState.roomCode);
 
     // Initialize procedural sound presets if clip pool is empty
@@ -185,7 +189,7 @@ export class GameStateHandler {
    */
   async joinRoom(roomCode: string, playerName: string, avatar: string): Promise<RoomState> {
     const cleanCode = roomCode.trim().toUpperCase();
-    const res = await fetch("/api/rooms/join", {
+    const res = await fetch(getApiUrl("/api/rooms/join"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -207,7 +211,7 @@ export class GameStateHandler {
     this.saveSession(data.roomState.roomCode, data.player.id);
     this.notify();
 
-    this.connectWebSocket(data.roomState.roomCode, data.player.id);
+    this.connectSockets(data.roomState.roomCode, data.player.id);
     this.startPolling(data.roomState.roomCode);
 
     return this.state;
@@ -217,7 +221,7 @@ export class GameStateHandler {
    * Leave current room
    */
   leaveRoom(): void {
-    this.disconnectWebSocket();
+    this.disconnectSockets();
     this.stopPolling();
     this.clearSession();
     this.state = null;
@@ -230,7 +234,7 @@ export class GameStateHandler {
    */
   async fetchState(roomCode: string): Promise<RoomState | null> {
     try {
-      const res = await fetch(`/api/rooms/${roomCode}/state`);
+      const res = await fetch(getApiUrl(`/api/rooms/${roomCode}/state`));
       if (!res.ok) {
         if (res.status === 404) {
           this.clearSession();
@@ -243,8 +247,8 @@ export class GameStateHandler {
       if (data.roomState) {
         this.state = normalizeRoomState(data.roomState);
         this.notify();
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-          this.connectWebSocket(roomCode, this.currentPlayerId);
+        if ((!this.ws || this.ws.readyState !== WebSocket.OPEN) && (!this.socketIo || !this.socketIo.connected)) {
+          this.connectSockets(roomCode, this.currentPlayerId);
         }
         this.startPolling(roomCode);
         return this.state;
@@ -274,7 +278,22 @@ export class GameStateHandler {
     if (!this.state) return;
     const roomCode = this.state.roomCode;
 
-    // Try WebSocket first
+    // 1. Try Socket.io first
+    if (this.socketIo && this.socketIo.connected) {
+      try {
+        this.socketIo.emit("action", {
+          roomCode,
+          playerId: this.currentPlayerId,
+          actionType,
+          payload,
+        });
+        return;
+      } catch (err) {
+        console.warn("Socket.io emit failed, trying WebSocket fallback:", err);
+      }
+    }
+
+    // 2. Try raw WebSocket fallback
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
         this.ws.send(
@@ -292,9 +311,9 @@ export class GameStateHandler {
       }
     }
 
-    // Fallback to HTTP POST
+    // 3. Fallback to HTTP POST
     try {
-      const res = await fetch(`/api/rooms/${roomCode}/action`, {
+      const res = await fetch(getApiUrl(`/api/rooms/${roomCode}/action`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -316,6 +335,50 @@ export class GameStateHandler {
   }
 
   /**
+   * Connect to real-time transports (Socket.io + WebSocket fallback)
+   */
+  private connectSockets(roomCode: string, playerId: string): void {
+    this.connectSocketIo(roomCode, playerId);
+    this.connectWebSocket(roomCode, playerId);
+  }
+
+  /**
+   * Socket.io client connection
+   */
+  private connectSocketIo(roomCode: string, playerId: string): void {
+    try {
+      const socket = getSocket();
+      this.socketIo = socket;
+
+      if (!socket.connected) {
+        socket.connect();
+      }
+
+      socket.emit("join", { roomCode, playerId });
+
+      socket.off("ROOM_STATE");
+      socket.off("room_state");
+
+      socket.on("ROOM_STATE", (msg: any) => {
+        const rawState = msg?.state || msg;
+        if (rawState) {
+          this.state = normalizeRoomState(rawState);
+          this.notify();
+        }
+      });
+
+      socket.on("room_state", (rawState: any) => {
+        if (rawState) {
+          this.state = normalizeRoomState(rawState);
+          this.notify();
+        }
+      });
+    } catch (err) {
+      console.warn("Socket.io initialization notice:", err);
+    }
+  }
+
+  /**
    * WebSocket connection and management
    */
   private connectWebSocket(roomCode: string, playerId: string): void {
@@ -325,8 +388,7 @@ export class GameStateHandler {
 
     try {
       this.isConnecting = true;
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
+      const wsUrl = getWsUrl("/ws");
 
       const ws = new WebSocket(wsUrl);
 
@@ -371,6 +433,14 @@ export class GameStateHandler {
       this.isConnecting = false;
       console.warn("Could not create WebSocket connection:", err);
     }
+  }
+
+  private disconnectSockets(): void {
+    if (this.socketIo) {
+      this.socketIo.disconnect();
+      this.socketIo = null;
+    }
+    this.disconnectWebSocket();
   }
 
   private disconnectWebSocket(): void {
