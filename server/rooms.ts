@@ -84,6 +84,137 @@ export interface RoomState {
   isTimerActive: boolean;
 }
 
+function createWavBase64(
+  sampleRate: number,
+  durationSeconds: number,
+  generator: (t: number) => number
+): { base64: string; waveform: number[] } {
+  const numSamples = Math.floor(sampleRate * durationSeconds);
+  const buffer = Buffer.alloc(44 + numSamples * 2);
+
+  // RIFF Header
+  buffer.write("RIFF", 0);
+  buffer.writeUInt32LE(36 + numSamples * 2, 4);
+  buffer.write("WAVE", 8);
+  buffer.write("fmt ", 12);
+  buffer.writeUInt32LE(16, 16); // SubChunk1Size (16 for PCM)
+  buffer.writeUInt16LE(1, 20); // AudioFormat (1 for PCM)
+  buffer.writeUInt16LE(1, 22); // NumChannels (1 for mono)
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * 2, 28); // ByteRate
+  buffer.writeUInt16LE(2, 32); // BlockAlign
+  buffer.writeUInt16LE(16, 34); // BitsPerSample
+  buffer.write("data", 36);
+  buffer.writeUInt32LE(numSamples * 2, 40);
+
+  const samples: number[] = new Array(numSamples);
+  for (let i = 0; i < numSamples; i++) {
+    const t = i / sampleRate;
+    const s = Math.max(-1, Math.min(1, generator(t)));
+    samples[i] = Math.abs(s);
+    const int16 = Math.floor(s * 32767);
+    buffer.writeInt16LE(int16, 44 + i * 2);
+  }
+
+  // Extract 36 waveform peaks
+  const step = Math.floor(numSamples / 36);
+  const waveform: number[] = [];
+  for (let b = 0; b < 36; b++) {
+    let peak = 0;
+    const start = b * step;
+    const end = Math.min(start + step, numSamples);
+    for (let k = start; k < end; k++) {
+      if (samples[k] > peak) peak = samples[k];
+    }
+    waveform.push(Math.round(peak * 100) / 100);
+  }
+
+  return {
+    base64: `data:audio/wav;base64,${buffer.toString("base64")}`,
+    waveform,
+  };
+}
+
+function getServerPresetClips(): AudioClip[] {
+  const sampleRate = 16000;
+
+  // 1. Cartoon Boing
+  const boing = createWavBase64(sampleRate, 1.8, (t) => {
+    const freq = 140 + 380 * Math.pow(t / 1.8, 0.6) + Math.sin(2 * Math.PI * 18 * t) * 45;
+    const env = Math.exp(-t * 1.8);
+    return Math.sin(2 * Math.PI * freq * t) * env * 0.75;
+  });
+
+  // 2. Alien Laser Blaster
+  const laser = createWavBase64(sampleRate, 1.4, (t) => {
+    const freq = Math.max(70, 2200 * Math.exp(-t * 5.5));
+    const env = Math.exp(-t * 2.5);
+    const s = Math.sin(2 * Math.PI * freq * t);
+    return (s > 0 ? 0.6 : -0.6) * env * 0.7;
+  });
+
+  // 3. Screaming Goat Bleat
+  const goat = createWavBase64(sampleRate, 2.0, (t) => {
+    const vibrato = Math.sin(2 * Math.PI * 14 * t) * 75;
+    const baseFreq = 420 + vibrato;
+    const tremolo = 0.6 + 0.4 * Math.sin(2 * Math.PI * 14 * t);
+    const env = t < 0.1 ? t / 0.1 : Math.exp(-(t - 0.1) * 1.5);
+    const wave = Math.sin(2 * Math.PI * baseFreq * t) + 0.5 * Math.sin(2 * Math.PI * baseFreq * 2 * t);
+    return wave * 0.45 * env * tremolo;
+  });
+
+  // 4. Disco Whistle
+  const whistle = createWavBase64(sampleRate, 1.5, (t) => {
+    const freq = 1100 + 400 * Math.sin(2 * Math.PI * 5 * t);
+    const env = Math.sin(Math.PI * (t / 1.5));
+    const noise = (Math.random() * 2 - 1) * 0.08;
+    return (Math.sin(2 * Math.PI * freq * t) * 0.75 + noise) * env;
+  });
+
+  return [
+    {
+      id: "server_preset_boing",
+      name: "Cartoon Boing",
+      url: boing.base64,
+      base64: boing.base64,
+      mimeType: "audio/wav",
+      durationSeconds: 1.8,
+      waveformSamples: boing.waveform,
+      isPreset: true,
+    },
+    {
+      id: "server_preset_laser",
+      name: "Alien Laser Blaster",
+      url: laser.base64,
+      base64: laser.base64,
+      mimeType: "audio/wav",
+      durationSeconds: 1.4,
+      waveformSamples: laser.waveform,
+      isPreset: true,
+    },
+    {
+      id: "server_preset_goat",
+      name: "Screaming Goat Bleat",
+      url: goat.base64,
+      base64: goat.base64,
+      mimeType: "audio/wav",
+      durationSeconds: 2.0,
+      waveformSamples: goat.waveform,
+      isPreset: true,
+    },
+    {
+      id: "server_preset_whistle",
+      name: "Disco Whistle",
+      url: whistle.base64,
+      base64: whistle.base64,
+      mimeType: "audio/wav",
+      durationSeconds: 1.5,
+      waveformSamples: whistle.waveform,
+      isPreset: true,
+    },
+  ];
+}
+
 export class RoomManager {
   private rooms: Map<string, RoomState> = new Map();
   private roomSockets: Map<string, Set<WebSocket>> = new Map();
@@ -100,13 +231,34 @@ export class RoomManager {
   }
 
   /**
-   * Create a new room with a unique code
+   * Create a new room with an auto-generated or custom code
    */
-  createRoom(hostName: string, hostAvatar: string): { roomState: RoomState; hostPlayer: Player } {
+  createRoom(
+    hostName: string,
+    hostAvatar: string,
+    requestedCode?: string
+  ): { roomState: RoomState; hostPlayer: Player } | { error: string } {
     let code: string;
-    do {
-      code = "ECHO-" + Math.floor(1000 + Math.random() * 9000);
-    } while (this.rooms.has(code));
+
+    if (requestedCode && requestedCode.trim()) {
+      let candidate = requestedCode.trim().toUpperCase().replace(/\s+/g, "");
+      if (!candidate.startsWith("ECHO-") && /^\d{4}$/.test(candidate)) {
+        candidate = `ECHO-${candidate}`;
+      }
+      if (this.rooms.has(candidate)) {
+        const existing = this.rooms.get(candidate)!;
+        if (existing.players.length > 0 && existing.phase !== "LOBBY") {
+          return {
+            error: `Room ${candidate} is currently running an active game. Please enter a different room code or leave blank to auto-generate.`,
+          };
+        }
+      }
+      code = candidate;
+    } else {
+      do {
+        code = "ECHO-" + Math.floor(1000 + Math.random() * 9000);
+      } while (this.rooms.has(code));
+    }
 
     const hostPlayer: Player = {
       id: "p_host_" + Math.random().toString(36).substring(2, 8),
@@ -121,7 +273,7 @@ export class RoomManager {
       roomCode: code,
       phase: "LOBBY",
       players: [hostPlayer],
-      clipPool: [],
+      clipPool: getServerPresetClips(),
       currentRound: {
         roundNumber: 1,
         totalRounds: 3,

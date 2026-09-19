@@ -14,7 +14,7 @@ import {
 
 interface RoomEntryViewProps {
   onJoinRoom: (roomCode: string, playerName: string, avatar: string) => Promise<void>;
-  onCreateRoom: (hostName: string, avatar: string) => Promise<void>;
+  onCreateRoom: (hostName: string, avatar: string, customRoomCode?: string) => Promise<void>;
   initialRoomCode?: string;
   isConnecting: boolean;
   errorMsg: string | null;
@@ -44,14 +44,25 @@ export const RoomEntryView: React.FC<RoomEntryViewProps> = ({
   errorMsg,
   onClearError,
 }) => {
-  const [activeTab, setActiveTab] = useState<"JOIN" | "HOST">(
-    initialRoomCode ? "JOIN" : "JOIN"
+  // Default to HOST if no invite code in URL, so creators can make a room instantly
+  const [activeTab, setActiveTab] = useState<"HOST" | "JOIN">(
+    initialRoomCode ? "JOIN" : "HOST"
   );
   const [roomCode, setRoomCode] = useState(initialRoomCode.toUpperCase());
+  const [customHostCode, setCustomHostCode] = useState("");
   const [playerName, setPlayerName] = useState(() => {
     return RANDOM_NAMES[Math.floor(Math.random() * RANDOM_NAMES.length)];
   });
   const [selectedAvatar, setSelectedAvatar] = useState(DEFAULT_AVATARS[0]);
+  const [serverOnline, setServerOnline] = useState<boolean | null>(null);
+
+  // Check server health on mount
+  useEffect(() => {
+    fetch("/api/health")
+      .then((res) => res.json())
+      .then(() => setServerOnline(true))
+      .catch(() => setServerOnline(false));
+  }, []);
 
   // Update room code if initialRoomCode changes (e.g. from invite link)
   useEffect(() => {
@@ -65,6 +76,12 @@ export const RoomEntryView: React.FC<RoomEntryViewProps> = ({
     onClearError();
     let val = e.target.value.toUpperCase().replace(/\s+/g, "");
     setRoomCode(val);
+  };
+
+  const handleCustomHostCodeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    onClearError();
+    let val = e.target.value.toUpperCase().replace(/\s+/g, "");
+    setCustomHostCode(val);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -81,8 +98,14 @@ export const RoomEntryView: React.FC<RoomEntryViewProps> = ({
       }
       await onJoinRoom(code, name, selectedAvatar);
     } else {
-      await onCreateRoom(name, selectedAvatar);
+      await onCreateRoom(name, selectedAvatar, customHostCode.trim() || undefined);
     }
+  };
+
+  const switchToCreateWithCode = (code: string) => {
+    setCustomHostCode(code);
+    setActiveTab("HOST");
+    onClearError();
   };
 
   return (
@@ -102,23 +125,32 @@ export const RoomEntryView: React.FC<RoomEntryViewProps> = ({
 
       {/* Main Entry Card */}
       <div className="bg-white rounded-3xl border border-stone-200 shadow-sm p-6 sm:p-8 space-y-6">
+        {/* Server Status & Mode Selector Tabs */}
+        <div className="flex items-center justify-between gap-2 pb-1">
+          <span className="text-[11px] font-bold uppercase tracking-wider text-stone-500">
+            Multiplayer Lobby
+          </span>
+          <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+            {serverOnline === true ? (
+              <span className="inline-flex items-center gap-1 text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                Server Online
+              </span>
+            ) : serverOnline === false ? (
+              <span className="inline-flex items-center gap-1 text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                Checking Server...
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 text-stone-500 bg-stone-50 px-2 py-0.5 rounded-full border border-stone-200">
+                Connecting...
+              </span>
+            )}
+          </div>
+        </div>
+
         {/* Mode Selector Tabs */}
         <div className="grid grid-cols-2 p-1 bg-stone-100 rounded-xl border border-stone-200/80">
-          <button
-            type="button"
-            onClick={() => {
-              setActiveTab("JOIN");
-              onClearError();
-            }}
-            className={`py-2.5 px-4 text-xs font-bold rounded-lg transition-all flex items-center justify-center gap-2 cursor-pointer ${
-              activeTab === "JOIN"
-                ? "bg-white text-stone-900 shadow-xs border border-stone-200/60"
-                : "text-stone-600 hover:text-stone-900"
-            }`}
-          >
-            <LogIn className="w-4 h-4 text-amber-600" />
-            Join Lobby
-          </button>
           <button
             type="button"
             onClick={() => {
@@ -133,6 +165,21 @@ export const RoomEntryView: React.FC<RoomEntryViewProps> = ({
           >
             <PlusCircle className="w-4 h-4 text-amber-600" />
             Host New Room
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab("JOIN");
+              onClearError();
+            }}
+            className={`py-2.5 px-4 text-xs font-bold rounded-lg transition-all flex items-center justify-center gap-2 cursor-pointer ${
+              activeTab === "JOIN"
+                ? "bg-white text-stone-900 shadow-xs border border-stone-200/60"
+                : "text-stone-600 hover:text-stone-900"
+            }`}
+          >
+            <LogIn className="w-4 h-4 text-amber-600" />
+            Join with Code
           </button>
         </div>
 
@@ -150,15 +197,49 @@ export const RoomEntryView: React.FC<RoomEntryViewProps> = ({
         {errorMsg && (
           <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 flex items-start gap-2.5">
             <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-            <div className="flex-1">
-              <strong className="font-semibold block mb-0.5">Could not enter room</strong>
-              <span>{errorMsg}</span>
+            <div className="flex-1 space-y-1">
+              <strong className="font-semibold block">Could not connect to room</strong>
+              <p>{errorMsg}</p>
+              {activeTab === "JOIN" && roomCode && (
+                <button
+                  type="button"
+                  onClick={() => switchToCreateWithCode(roomCode)}
+                  className="mt-1 text-[11px] font-bold text-amber-700 hover:text-amber-800 underline block cursor-pointer"
+                >
+                  👉 Create "{roomCode}" as a new room instead?
+                </button>
+              )}
             </div>
           </div>
         )}
 
         <form onSubmit={handleSubmit} className="space-y-5">
-          {/* Room Code Input (for Join Mode) */}
+          {/* Host Mode: Custom Room Code (Optional) */}
+          {activeTab === "HOST" && (
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <label className="block text-xs font-bold uppercase tracking-wider text-stone-700">
+                  Room Code (Optional)
+                </label>
+                <span className="text-[10px] text-stone-400 font-medium">
+                  Auto-generates if empty
+                </span>
+              </div>
+              <input
+                type="text"
+                value={customHostCode}
+                onChange={handleCustomHostCodeChange}
+                placeholder="Leave blank for auto-code, or e.g. 7777 / PARTY"
+                maxLength={12}
+                className="w-full px-4 py-2.5 bg-stone-50 border border-stone-300 rounded-xl text-sm font-mono font-bold tracking-wider text-stone-900 placeholder:text-stone-400 placeholder:font-sans placeholder:font-normal focus:outline-none focus:ring-2 focus:ring-amber-500/20 focus:border-amber-600 transition-colors uppercase"
+              />
+              <p className="text-[11px] text-stone-500">
+                You can specify a friendly code (e.g. "8888") or leave blank for an auto-generated ECHO-XXXX code.
+              </p>
+            </div>
+          )}
+
+          {/* Join Mode: Room Code Input */}
           {activeTab === "JOIN" && (
             <div className="space-y-1.5">
               <label className="block text-xs font-bold uppercase tracking-wider text-stone-700">
@@ -176,7 +257,7 @@ export const RoomEntryView: React.FC<RoomEntryViewProps> = ({
                 />
               </div>
               <p className="text-[11px] text-stone-500">
-                Enter the 4-digit code or ECHO-XXXX provided by the host.
+                Enter the code provided by the game host.
               </p>
             </div>
           )}
@@ -191,7 +272,7 @@ export const RoomEntryView: React.FC<RoomEntryViewProps> = ({
                 type="text"
                 value={playerName}
                 onChange={(e) => setPlayerName(e.target.value)}
-                placeholder="Enter your name"
+                placeholder="Enter your nickname"
                 required
                 maxLength={20}
                 className="flex-1 px-4 py-3 bg-stone-50 border border-stone-300 rounded-xl text-sm font-semibold text-stone-900 placeholder:text-stone-400 focus:outline-none focus:ring-2 focus:ring-amber-500/20 focus:border-amber-600 transition-colors"
@@ -242,17 +323,19 @@ export const RoomEntryView: React.FC<RoomEntryViewProps> = ({
             {isConnecting ? (
               <>
                 <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                <span>Connecting to Lobby...</span>
+                <span>
+                  {activeTab === "HOST" ? "Creating Room on Server..." : "Connecting to Lobby..."}
+                </span>
               </>
-            ) : activeTab === "JOIN" ? (
+            ) : activeTab === "HOST" ? (
               <>
-                <LogIn className="w-4 h-4" />
-                <span>Enter Room & Join Match</span>
+                <Gamepad2 className="w-4 h-4" />
+                <span>Create Room on Server</span>
               </>
             ) : (
               <>
-                <Gamepad2 className="w-4 h-4" />
-                <span>Create Lobby as Host</span>
+                <LogIn className="w-4 h-4" />
+                <span>Enter Room & Join Match</span>
               </>
             )}
           </button>
@@ -260,8 +343,8 @@ export const RoomEntryView: React.FC<RoomEntryViewProps> = ({
 
         {/* Quick Instructions Footer */}
         <div className="pt-4 border-t border-stone-100 flex items-center justify-between text-[11px] text-stone-500">
-          <span>🎮 Web Audio & Microphone Required</span>
-          <span>⚡ Real-time Multi-Device Sync</span>
+          <span>🎮 Web Audio & Mic Mimicry</span>
+          <span>⚡ Real-Time Multiplayer</span>
         </div>
       </div>
     </div>

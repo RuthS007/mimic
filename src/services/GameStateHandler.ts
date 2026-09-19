@@ -143,15 +143,24 @@ export class GameStateHandler {
   /**
    * Create a new room on the server
    */
-  async createRoom(hostName: string, hostAvatar: string): Promise<RoomState> {
+  async createRoom(
+    hostName: string,
+    hostAvatar: string,
+    customRoomCode?: string
+  ): Promise<RoomState> {
     const res = await fetch("/api/rooms/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ hostName, hostAvatar }),
+      body: JSON.stringify({
+        hostName,
+        hostAvatar,
+        customRoomCode: customRoomCode?.trim() || undefined,
+      }),
     });
 
     if (!res.ok) {
-      throw new Error("Failed to create room on server");
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || "Failed to create room on server. Please try again.");
     }
 
     const data = await res.json();

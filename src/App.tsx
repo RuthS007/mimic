@@ -64,11 +64,15 @@ export default function App() {
     }
   };
 
-  const handleCreateRoom = async (hostName: string, avatar: string) => {
+  const handleCreateRoom = async (
+    hostName: string,
+    avatar: string,
+    customRoomCode?: string
+  ) => {
     setIsConnecting(true);
     setErrorMsg(null);
     try {
-      await gameHandler.createRoom(hostName, avatar);
+      await gameHandler.createRoom(hostName, avatar, customRoomCode);
     } catch (err: any) {
       setErrorMsg(err.message || "Failed to create room.");
     } finally {

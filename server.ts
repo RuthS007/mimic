@@ -13,6 +13,7 @@ const app = express();
 const PORT = 3000;
 
 app.use(express.json({ limit: "15mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 // Lazy Gemini client
 let aiClient: GoogleGenAI | null = null;
@@ -48,15 +49,22 @@ app.get("/api/health", (_req, res) => {
 // Room Creation API
 app.post("/api/rooms/create", (req, res) => {
   try {
-    const { hostName, hostAvatar } = req.body || {};
-    const { roomState, hostPlayer } = roomManager.createRoom(
+    const { hostName, hostAvatar, customRoomCode, roomCode } = req.body || {};
+    const codeToUse = customRoomCode || roomCode;
+    const result = roomManager.createRoom(
       hostName || "Host Player",
-      hostAvatar || "🎙️"
+      hostAvatar || "🎙️",
+      codeToUse
     );
-    res.json({ roomState, player: hostPlayer });
+
+    if ("error" in result) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    res.json({ roomState: result.roomState, player: result.hostPlayer });
   } catch (err: any) {
     console.error("Error creating room:", err);
-    res.status(500).json({ error: "Failed to create room" });
+    res.status(500).json({ error: err?.message || "Failed to create room on server" });
   }
 });
 
