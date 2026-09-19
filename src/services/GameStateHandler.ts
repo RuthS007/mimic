@@ -24,6 +24,25 @@ import type { Socket } from "socket.io-client";
 
 export type StateListener = (state: RoomState | null) => void;
 
+export function sanitizeClipForNetwork(clip: AudioClip): AudioClip {
+  const cleanUrl = clip.base64?.startsWith("data:")
+    ? clip.base64
+    : clip.base64
+      ? `data:${clip.mimeType || "audio/wav"};base64,${clip.base64}`
+      : clip.url;
+
+  return {
+    id: clip.id,
+    name: clip.name,
+    url: cleanUrl,
+    base64: cleanUrl,
+    mimeType: clip.mimeType || "audio/mpeg",
+    durationSeconds: clip.durationSeconds || 1,
+    waveformSamples: Array.isArray(clip.waveformSamples) ? clip.waveformSamples : [],
+    isPreset: Boolean(clip.isPreset),
+  };
+}
+
 function normalizeAudioClip(clip: AudioClip): AudioClip {
   let validUrl = clip.url;
   if (!validUrl || validUrl.startsWith("blob:")) {
@@ -475,20 +494,41 @@ export class GameStateHandler {
   // --- Game Action Methods ---
 
   addClip(clip: AudioClip): void {
-    this.sendAction("ADD_CLIP", { clip });
+    const cleanClip = sanitizeClipForNetwork(clip);
+    // Optimistic local update so UI reflects immediately
+    if (this.state) {
+      this.state.clipPool = this.state.clipPool.filter((c) => c.id !== cleanClip.id);
+      this.state.clipPool.push(cleanClip);
+      this.notify();
+    }
+    this.sendAction("ADD_CLIP", { clip: cleanClip });
   }
 
   removeClip(clipId: string): void {
+    if (this.state) {
+      this.state.clipPool = this.state.clipPool.filter((c) => c.id !== clipId);
+      this.notify();
+    }
     this.sendAction("REMOVE_CLIP", { clipId });
   }
 
   async reloadPresets(): Promise<void> {
     const presets = await AudioClipManager.generatePresetClips();
+    const cleanPresets = presets.map(sanitizeClipForNetwork);
     const customClips = (this.state?.clipPool || []).filter((c) => !c.isPreset);
-    this.sendAction("SET_CLIPS", { clips: [...customClips, ...presets] });
+    const newPool = [...customClips, ...cleanPresets];
+    if (this.state) {
+      this.state.clipPool = newPool;
+      this.notify();
+    }
+    this.sendAction("SET_CLIPS", { clips: newPool });
   }
 
   clearAllClips(): void {
+    if (this.state) {
+      this.state.clipPool = [];
+      this.notify();
+    }
     this.sendAction("CLEAR_CLIPS", {});
   }
 

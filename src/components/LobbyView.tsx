@@ -17,6 +17,7 @@ import {
   Shuffle,
   Volume2,
   FileAudio,
+  AlertCircle,
 } from "lucide-react";
 import { RoomState, AudioClip } from "../types";
 import { GameStateHandler } from "../services/GameStateHandler";
@@ -37,6 +38,7 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
   const [copiedLink, setCopiedLink] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [isProcessingFiles, setIsProcessingFiles] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [playingClipId, setPlayingClipId] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -88,17 +90,45 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
   const handleFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     setIsProcessingFiles(true);
+    setUploadError(null);
+
+    let processedCount = 0;
+    let skippedNonAudio = 0;
 
     try {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        if (file.type.startsWith("audio/") || /\.(mp3|wav|ogg|webm|m4a|aac|flac)$/i.test(file.name)) {
-          const clip = await AudioClipManager.processUploadedFile(file);
-          gameHandler.addClip(clip);
+
+        // Max 25MB check
+        if (file.size > 25 * 1024 * 1024) {
+          setUploadError(`"${file.name}" exceeds 25MB. Please upload shorter audio clips.`);
+          continue;
+        }
+
+        const isAudio =
+          file.type.startsWith("audio/") ||
+          /\.(mp3|wav|ogg|webm|m4a|aac|flac|opus|wma|aiff|caf|m4r|3gp)$/i.test(file.name);
+
+        if (isAudio) {
+          try {
+            const clip = await AudioClipManager.processUploadedFile(file);
+            gameHandler.addClip(clip);
+            processedCount++;
+          } catch (fileErr: any) {
+            console.error(`Failed to process audio file "${file.name}":`, fileErr);
+            setUploadError(`Could not decode "${file.name}". Please ensure it is a valid audio file.`);
+          }
+        } else {
+          skippedNonAudio++;
         }
       }
-    } catch (err) {
+
+      if (processedCount === 0 && skippedNonAudio > 0) {
+        setUploadError("Please upload audio files (MP3, WAV, WebM, OGG, M4A, AAC, FLAC, etc.).");
+      }
+    } catch (err: any) {
       console.error("Error processing audio files:", err);
+      setUploadError("Failed to upload audio file. Please try a different audio format.");
     } finally {
       setIsProcessingFiles(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -248,6 +278,23 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
           </div>
         </div>
 
+        {/* Upload Error Banner */}
+        {uploadError && (
+          <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-xl flex items-center justify-between text-xs text-rose-800 animate-fadeIn">
+            <div className="flex items-center gap-2.5">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span className="font-medium">{uploadError}</span>
+            </div>
+            <button
+              onClick={() => setUploadError(null)}
+              className="text-rose-500 hover:text-rose-800 font-bold ml-3 px-1 cursor-pointer"
+              title="Dismiss"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
         {/* Drag & Drop Upload Zone */}
         <div
           onDragOver={onDragOver}
@@ -263,7 +310,7 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
           <input
             ref={fileInputRef}
             type="file"
-            accept="audio/*,.mp3,.wav,.ogg,.webm,.m4a"
+            accept="audio/*,.mp3,.wav,.ogg,.webm,.m4a,.aac,.flac,.opus,.wma,.aiff,.caf,.m4r,.3gp"
             multiple
             className="hidden"
             onChange={(e) => handleFiles(e.target.files)}

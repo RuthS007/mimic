@@ -48,8 +48,8 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "15mb" }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 // Lazy Gemini client
 let aiClient: GoogleGenAI | null = null;
@@ -276,6 +276,7 @@ async function startServer() {
   // Initialize Socket.io server with CORS support for Vercel / multi-origin clients
   const io = new SocketIOServer(server, {
     path: "/socket.io/",
+    maxHttpBufferSize: 5e7, // 50MB allows audio clip uploads
     cors: {
       origin: (origin, callback) => {
         callback(null, true);
@@ -326,7 +327,11 @@ async function startServer() {
   });
 
   // Native WebSocketServer for low-overhead client fallback
-  const wss = new WebSocketServer({ server, path: "/ws" });
+  const wss = new WebSocketServer({
+    server,
+    path: "/ws",
+    maxPayload: 50 * 1024 * 1024, // 50MB allows audio clip uploads
+  });
 
   wss.on("connection", (ws: WebSocket, req) => {
     // Keep alive ping-pong

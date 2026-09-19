@@ -19,38 +19,132 @@ export class AudioClipManager {
   }
 
   /**
-   * Process a user-uploaded audio file (.mp3, .wav, .webm, .ogg, .m4a)
+   * Process a user-uploaded audio file (.mp3, .wav, .webm, .ogg, .m4a, .aac, .flac, etc.)
    */
   static async processUploadedFile(file: File): Promise<AudioClip> {
     const ctx = this.getAudioContext();
     if (ctx.state === "suspended") {
-      await ctx.resume();
+      try {
+        await ctx.resume();
+      } catch (resumeErr) {
+        console.warn("Could not resume AudioContext:", resumeErr);
+      }
     }
 
-    const arrayBuffer = await file.arrayBuffer();
-    // Use slice to avoid buffer detachment issues
-    const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
-    const durationSeconds = Math.round(audioBuffer.duration * 10) / 10;
-    const waveformSamples = extractWaveformPeaks(audioBuffer, 36);
+    let audioBuffer: AudioBuffer | undefined;
+    let durationSeconds = 2.0;
+    let waveformSamples: number[] = [];
+
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      // Use slice to avoid buffer detachment issues
+      audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+      durationSeconds = Math.round(audioBuffer.duration * 10) / 10;
+      waveformSamples = extractWaveformPeaks(audioBuffer, 36);
+    } catch (decodeErr) {
+      console.warn("Direct decodeAudioData failed, falling back to HTMLAudioElement duration extraction:", decodeErr);
+      durationSeconds = await this.getAudioDurationFallback(file);
+      waveformSamples = this.generateSyntheticPeaks(36);
+    }
 
     const base64 = await blobToBase64(file);
-    const url = URL.createObjectURL(file);
+    const mimeType = file.type || this.guessMimeType(file.name);
+    const dataUrl = base64.startsWith("data:") ? base64 : `data:${mimeType};base64,${base64}`;
 
     // Clean up filename for display
     const cleanName = file.name.replace(/\.[^/.]+$/, "").replace(/[-_]/g, " ");
 
     return {
       id: "clip_" + Math.random().toString(36).substring(2, 9),
-      name: cleanName.charAt(0).toUpperCase() + cleanName.slice(1),
-      url,
-      blob: file,
-      base64,
-      mimeType: file.type || "audio/mpeg",
-      durationSeconds,
-      waveformSamples,
+      name: (cleanName.charAt(0).toUpperCase() + cleanName.slice(1)).trim() || "Uploaded Clip",
+      url: dataUrl,
+      base64: dataUrl,
+      mimeType,
+      durationSeconds: Math.max(0.5, durationSeconds),
+      waveformSamples: waveformSamples.length > 0 ? waveformSamples : this.generateSyntheticPeaks(36),
       audioBuffer,
       isPreset: false,
     };
+  }
+
+  /**
+   * Fallback duration detection using an HTML Audio element
+   */
+  private static getAudioDurationFallback(file: File): Promise<number> {
+    return new Promise((resolve) => {
+      try {
+        const url = URL.createObjectURL(file);
+        const audio = new Audio(url);
+        let resolved = false;
+
+        const cleanup = () => {
+          if (!resolved) {
+            resolved = true;
+            try {
+              URL.revokeObjectURL(url);
+            } catch (_) {}
+          }
+        };
+
+        audio.onloadedmetadata = () => {
+          const d = audio.duration;
+          cleanup();
+          resolve(isFinite(d) && d > 0 ? Math.round(d * 10) / 10 : 2.5);
+        };
+
+        audio.onerror = () => {
+          cleanup();
+          resolve(2.5);
+        };
+
+        // 3-second safety timeout
+        setTimeout(() => {
+          cleanup();
+          resolve(2.5);
+        }, 3000);
+      } catch (err) {
+        resolve(2.5);
+      }
+    });
+  }
+
+  /**
+   * Synthetic waveform generator when raw decoding is unavailable
+   */
+  private static generateSyntheticPeaks(count: number = 36): number[] {
+    const peaks: number[] = [];
+    for (let i = 0; i < count; i++) {
+      const norm = Math.sin((i / count) * Math.PI);
+      const ripple = (Math.sin(i * 1.8) + 1) * 0.15;
+      peaks.push(Math.min(1.0, Math.max(0.18, norm * 0.75 + ripple)));
+    }
+    return peaks;
+  }
+
+  /**
+   * Guess MIME type from extension if file.type is empty (common on Windows/mobile)
+   */
+  private static guessMimeType(filename: string): string {
+    const ext = filename.split(".").pop()?.toLowerCase();
+    switch (ext) {
+      case "mp3":
+        return "audio/mpeg";
+      case "wav":
+        return "audio/wav";
+      case "ogg":
+        return "audio/ogg";
+      case "webm":
+        return "audio/webm";
+      case "m4a":
+      case "aac":
+        return "audio/mp4";
+      case "flac":
+        return "audio/flac";
+      case "opus":
+        return "audio/opus";
+      default:
+        return "audio/mpeg";
+    }
   }
 
   /**

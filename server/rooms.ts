@@ -447,16 +447,35 @@ export class RoomManager {
     switch (actionType) {
       case "ADD_CLIP": {
         if (payload?.clip) {
-          // Remove if duplicate id
-          room.clipPool = room.clipPool.filter((c) => c.id !== payload.clip.id);
-          room.clipPool.push(payload.clip);
+          const raw = payload.clip;
+          const cleanClip: AudioClip = {
+            id: String(raw.id || "clip_" + Math.random().toString(36).substring(2, 9)),
+            name: String(raw.name || "Audio Clip"),
+            url: String(raw.url || raw.base64 || ""),
+            base64: typeof raw.base64 === "string" ? raw.base64 : undefined,
+            mimeType: String(raw.mimeType || "audio/mpeg"),
+            durationSeconds: typeof raw.durationSeconds === "number" ? raw.durationSeconds : 2,
+            waveformSamples: Array.isArray(raw.waveformSamples) ? raw.waveformSamples : [],
+            isPreset: Boolean(raw.isPreset),
+          };
+          room.clipPool = room.clipPool.filter((c) => c.id !== cleanClip.id);
+          room.clipPool.push(cleanClip);
         }
         break;
       }
 
       case "SET_CLIPS": {
         if (Array.isArray(payload?.clips)) {
-          room.clipPool = payload.clips;
+          room.clipPool = payload.clips.map((raw: any) => ({
+            id: String(raw.id || "clip_" + Math.random().toString(36).substring(2, 9)),
+            name: String(raw.name || "Audio Clip"),
+            url: String(raw.url || raw.base64 || ""),
+            base64: typeof raw.base64 === "string" ? raw.base64 : undefined,
+            mimeType: String(raw.mimeType || "audio/mpeg"),
+            durationSeconds: typeof raw.durationSeconds === "number" ? raw.durationSeconds : 2,
+            waveformSamples: Array.isArray(raw.waveformSamples) ? raw.waveformSamples : [],
+            isPreset: Boolean(raw.isPreset),
+          }));
         }
         break;
       }
