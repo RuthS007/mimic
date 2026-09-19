@@ -1,0 +1,7 @@
+{
+  "name": "Echo Match",
+  "description": "Multiplayer audio party game where players upload sound clips before the match, randomize them across players, and take turns mimicking their assigned audio.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
