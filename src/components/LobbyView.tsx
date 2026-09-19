@@ -33,7 +33,8 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
   gameHandler,
   currentPlayerId,
 }) => {
-  const [copied, setCopied] = useState(false);
+  const [copiedCode, setCopiedCode] = useState(false);
+  const [copiedLink, setCopiedLink] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [isProcessingFiles, setIsProcessingFiles] = useState(false);
   const [playingClipId, setPlayingClipId] = useState<string | null>(null);
@@ -41,17 +42,24 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
 
-  const [editingName, setEditingName] = useState(
-    roomState.players.find((p) => p.id === currentPlayerId)?.name || "Host Player"
-  );
-  const [editingAvatar, setEditingAvatar] = useState(
-    roomState.players.find((p) => p.id === currentPlayerId)?.avatar || "🎙️"
-  );
+  const currentPlayer = roomState.players.find((p) => p.id === currentPlayerId);
+  const hostPlayer = roomState.players.find((p) => p.isHost);
+  const isCurrentPlayerHost = Boolean(currentPlayer?.isHost);
+
+  const [editingName, setEditingName] = useState(currentPlayer?.name || "Player");
+  const [editingAvatar, setEditingAvatar] = useState(currentPlayer?.avatar || "🎙️");
 
   const copyRoomCode = () => {
     navigator.clipboard.writeText(roomState.roomCode);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    setCopiedCode(true);
+    setTimeout(() => setCopiedCode(false), 2000);
+  };
+
+  const copyInviteLink = () => {
+    const inviteUrl = `${window.location.origin}${window.location.pathname}?room=${roomState.roomCode}`;
+    navigator.clipboard.writeText(inviteUrl);
+    setCopiedLink(true);
+    setTimeout(() => setCopiedLink(false), 2000);
   };
 
   const handleProfileSave = () => {
@@ -159,21 +167,45 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
             </p>
           </div>
 
-          {/* Room Code Card */}
-          <div className="bg-stone-800/90 border border-stone-700/80 rounded-xl p-3.5 flex flex-col items-center min-w-[150px]">
-            <span className="text-[11px] font-semibold tracking-wider text-stone-400 uppercase">
-              Room Code
-            </span>
-            <span className="text-2xl font-mono font-black text-amber-400 my-0.5">
-              {roomState.roomCode}
-            </span>
-            <button
-              onClick={copyRoomCode}
-              className="mt-1 flex items-center gap-1.5 text-xs text-stone-300 hover:text-white bg-stone-700 hover:bg-stone-600 px-2.5 py-1 rounded-md transition-colors cursor-pointer"
-            >
-              {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-              <span>{copied ? "Copied!" : "Copy Code"}</span>
-            </button>
+          {/* Room Code & Invite Card */}
+          <div className="bg-stone-800/90 border border-stone-700/80 rounded-2xl p-4 flex flex-col items-center min-w-[200px] gap-2.5">
+            <div className="text-center">
+              <span className="text-[10px] font-bold tracking-widest text-stone-400 uppercase block">
+                Lobby Room Code
+              </span>
+              <span className="text-3xl font-mono font-black text-amber-400 tracking-wider">
+                {roomState.roomCode}
+              </span>
+            </div>
+
+            <div className="flex flex-col w-full gap-1.5">
+              <div className="flex items-center gap-1.5 w-full">
+                <button
+                  onClick={copyRoomCode}
+                  className="flex-1 flex items-center justify-center gap-1.5 text-xs font-semibold text-stone-200 hover:text-white bg-stone-700 hover:bg-stone-600 px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer"
+                  title="Copy room code to clipboard"
+                >
+                  {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedCode ? "Copied Code!" : "Copy Code"}</span>
+                </button>
+
+                <button
+                  onClick={copyInviteLink}
+                  className="flex-1 flex items-center justify-center gap-1.5 text-xs font-semibold text-stone-200 hover:text-white bg-stone-700 hover:bg-stone-600 px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer"
+                  title="Copy invite URL to share with friends"
+                >
+                  {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Sparkles className="w-3.5 h-3.5 text-amber-400" />}
+                  <span>{copiedLink ? "Link Copied!" : "Invite Link"}</span>
+                </button>
+              </div>
+
+              <button
+                onClick={() => gameHandler.leaveRoom()}
+                className="w-full text-center text-[11px] text-stone-400 hover:text-stone-200 py-1 transition-colors hover:underline cursor-pointer"
+              >
+                ← Switch or Join Another Room
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -547,16 +579,30 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
 
             {/* Start Game Action */}
             <div className="pt-2">
-              <button
-                onClick={() => gameHandler.startGame()}
-                className="w-full py-3.5 px-4 bg-amber-600 hover:bg-amber-500 active:bg-amber-700 text-white font-bold rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer text-sm"
-              >
-                <Shuffle className="w-4 h-4 fill-white" />
-                Randomize & Start ({roomState.players.length} Players)
-              </button>
-              <p className="text-[11px] text-stone-500 mt-2 text-center">
-                Clips from the pool will be shuffled and assigned to each player!
-              </p>
+              {isCurrentPlayerHost ? (
+                <>
+                  <button
+                    onClick={() => gameHandler.startGame()}
+                    className="w-full py-3.5 px-4 bg-amber-600 hover:bg-amber-500 active:bg-amber-700 text-white font-bold rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer text-sm"
+                  >
+                    <Shuffle className="w-4 h-4 fill-white" />
+                    Randomize & Start ({roomState.players.length} Players)
+                  </button>
+                  <p className="text-[11px] text-stone-500 mt-2 text-center">
+                    Clips from the pool will be shuffled and assigned to each player!
+                  </p>
+                </>
+              ) : (
+                <div className="p-4 bg-amber-50/80 border border-amber-200/80 rounded-xl text-center space-y-1">
+                  <div className="flex items-center justify-center gap-2 text-amber-800 text-xs font-bold">
+                    <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                    <span>Waiting for Host to Start Match</span>
+                  </div>
+                  <p className="text-[11px] text-stone-600">
+                    Host <strong>{hostPlayer?.name || "Host"}</strong> controls the start. You can upload more sounds to the pool above!
+                  </p>
+                </div>
+              )}
             </div>
           </div>
         </div>

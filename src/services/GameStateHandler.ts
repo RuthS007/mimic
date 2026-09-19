@@ -1,8 +1,9 @@
 /**
  * Echo Match - GameStateHandler
- * Turn-based party game state manager.
- * Supports pre-game audio clip pool uploads, clip randomizer for each player,
- * and sequential turn-taking where each player mimics their assigned audio clip.
+ * Real-time multiplayer room state manager.
+ * Connects to the Node.js backend over WebSocket with HTTP polling fallback.
+ * Synchronizes clip pools, player lists, randomized sound assignments,
+ * turn timers, and mimicry evaluations across all players in a room.
  */
 
 import {
@@ -18,56 +19,80 @@ import {
 import { AudioComparer } from "./AudioComparer";
 import { AudioClipManager } from "./AudioClipManager";
 
-export type StateListener = (state: RoomState) => void;
+export type StateListener = (state: RoomState | null) => void;
+
+function normalizeAudioClip(clip: AudioClip): AudioClip {
+  let validUrl = clip.url;
+  if (!validUrl || validUrl.startsWith("blob:")) {
+    if (clip.base64) {
+      validUrl = clip.base64.startsWith("data:")
+        ? clip.base64
+        : `data:${clip.mimeType || "audio/wav"};base64,${clip.base64}`;
+    }
+  }
+  return {
+    ...clip,
+    url: validUrl,
+  };
+}
+
+function normalizeAudioRecording(rec: AudioRecording): AudioRecording {
+  let validUrl = rec.url;
+  if (!validUrl || validUrl.startsWith("blob:")) {
+    if (rec.base64) {
+      validUrl = rec.base64.startsWith("data:")
+        ? rec.base64
+        : `data:${rec.mimeType || "audio/webm"};base64,${rec.base64}`;
+    }
+  }
+  return {
+    ...rec,
+    url: validUrl,
+  };
+}
+
+function normalizeRoomState(state: RoomState): RoomState {
+  return {
+    ...state,
+    clipPool: (state.clipPool || []).map(normalizeAudioClip),
+    players: (state.players || []).map((p) => ({
+      ...p,
+      assignedClip: p.assignedClip ? normalizeAudioClip(p.assignedClip) : undefined,
+      turnSubmission: p.turnSubmission
+        ? {
+            ...p.turnSubmission,
+            targetClip: normalizeAudioClip(p.turnSubmission.targetClip),
+            mimicRecording: normalizeAudioRecording(p.turnSubmission.mimicRecording),
+          }
+        : undefined,
+    })),
+  };
+}
 
 export class GameStateHandler {
-  private state: RoomState;
+  private state: RoomState | null = null;
+  private currentPlayerId: string = "";
   private listeners: Set<StateListener> = new Set();
-  private timerInterval: any = null;
+  private ws: WebSocket | null = null;
+  private pollInterval: any = null;
+  private isConnecting: boolean = false;
+  private pingInterval: any = null;
 
-  constructor(initialPlayerName: string = "Host Player") {
-    const hostId = "p_host_" + Math.random().toString(36).substring(2, 7);
-    const hostPlayer: Player = {
-      id: hostId,
-      name: initialPlayerName,
-      avatar: "🎙️",
-      isHost: true,
-      score: 0,
-      isReady: true,
-    };
-
-    this.state = {
-      roomCode: "ECHO-" + Math.floor(1000 + Math.random() * 9000),
-      phase: "LOBBY",
-      players: [hostPlayer],
-      clipPool: [],
-      currentRound: {
-        roundNumber: 1,
-        totalRounds: 3,
-        activePlayerIndex: 0,
-        turnSubmissions: {},
-      },
-      scoringEngine: "GEMINI_MULTIMODAL",
-      timerRemaining: 0,
-      isTimerActive: false,
-    };
-
-    // Load initial presets into clip pool asynchronously
-    this.initDefaultPresets();
-  }
-
-  private async initDefaultPresets(): Promise<void> {
-    try {
-      const presets = await AudioClipManager.generatePresetClips();
-      this.state.clipPool = presets;
-      this.notify();
-    } catch (err) {
-      console.warn("Could not generate procedural presets immediately:", err);
+  constructor() {
+    // Check if session storage has existing room info
+    const savedRoomCode = sessionStorage.getItem("echo_room_code");
+    const savedPlayerId = sessionStorage.getItem("echo_player_id");
+    if (savedRoomCode && savedPlayerId) {
+      this.currentPlayerId = savedPlayerId;
+      this.fetchState(savedRoomCode).catch(() => {
+        // Room likely expired or server restarted
+        this.clearSession();
+      });
     }
   }
 
   /**
-   * Subscribe to state updates
+   * Subscribe to room state updates
    */
   subscribe(listener: StateListener): () => void {
     this.listeners.add(listener);
@@ -75,280 +100,381 @@ export class GameStateHandler {
     return () => this.listeners.delete(listener);
   }
 
-  /**
-   * Broadcast state changes to all subscribers
-   */
   private notify(): void {
     const currentState = this.getState();
     this.listeners.forEach((listener) => listener(currentState));
   }
 
-  /**
-   * Get an immutable snapshot of current state
-   */
-  getState(): RoomState {
-    return JSON.parse(JSON.stringify(this.state));
+  getState(): RoomState | null {
+    return this.state ? JSON.parse(JSON.stringify(this.state)) : null;
+  }
+
+  getCurrentPlayerId(): string {
+    return this.currentPlayerId;
+  }
+
+  getCurrentPlayer(): Player | undefined {
+    return this.state?.players.find((p) => p.id === this.currentPlayerId);
+  }
+
+  isHost(): boolean {
+    const player = this.getCurrentPlayer();
+    return Boolean(player?.isHost);
+  }
+
+  private saveSession(roomCode: string, playerId: string): void {
+    try {
+      sessionStorage.setItem("echo_room_code", roomCode);
+      sessionStorage.setItem("echo_player_id", playerId);
+    } catch {
+      // Ignored
+    }
+  }
+
+  private clearSession(): void {
+    try {
+      sessionStorage.removeItem("echo_room_code");
+      sessionStorage.removeItem("echo_player_id");
+    } catch {
+      // Ignored
+    }
   }
 
   /**
-   * Clip Pool Management
+   * Create a new room on the server
    */
-  addClip(clip: AudioClip): void {
-    this.state.clipPool.push(clip);
+  async createRoom(hostName: string, hostAvatar: string): Promise<RoomState> {
+    const res = await fetch("/api/rooms/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hostName, hostAvatar }),
+    });
+
+    if (!res.ok) {
+      throw new Error("Failed to create room on server");
+    }
+
+    const data = await res.json();
+    this.currentPlayerId = data.player.id;
+    this.state = normalizeRoomState(data.roomState);
+    this.saveSession(data.roomState.roomCode, data.player.id);
     this.notify();
+
+    this.connectWebSocket(data.roomState.roomCode, data.player.id);
+    this.startPolling(data.roomState.roomCode);
+
+    // Initialize procedural sound presets if clip pool is empty
+    if (!this.state.clipPool || this.state.clipPool.length === 0) {
+      this.initDefaultPresets();
+    }
+
+    return this.state;
+  }
+
+  /**
+   * Join an existing room via room code
+   */
+  async joinRoom(roomCode: string, playerName: string, avatar: string): Promise<RoomState> {
+    const cleanCode = roomCode.trim().toUpperCase();
+    const res = await fetch("/api/rooms/join", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        roomCode: cleanCode,
+        playerName,
+        avatar,
+        playerId: this.currentPlayerId || undefined,
+      }),
+    });
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || `Could not join room ${cleanCode}`);
+    }
+
+    const data = await res.json();
+    this.currentPlayerId = data.player.id;
+    this.state = normalizeRoomState(data.roomState);
+    this.saveSession(data.roomState.roomCode, data.player.id);
+    this.notify();
+
+    this.connectWebSocket(data.roomState.roomCode, data.player.id);
+    this.startPolling(data.roomState.roomCode);
+
+    return this.state;
+  }
+
+  /**
+   * Leave current room
+   */
+  leaveRoom(): void {
+    this.disconnectWebSocket();
+    this.stopPolling();
+    this.clearSession();
+    this.state = null;
+    this.currentPlayerId = "";
+    this.notify();
+  }
+
+  /**
+   * Fetch current room state from REST endpoint
+   */
+  async fetchState(roomCode: string): Promise<RoomState | null> {
+    try {
+      const res = await fetch(`/api/rooms/${roomCode}/state`);
+      if (!res.ok) {
+        if (res.status === 404) {
+          this.clearSession();
+          this.state = null;
+          this.notify();
+        }
+        return null;
+      }
+      const data = await res.json();
+      if (data.roomState) {
+        this.state = normalizeRoomState(data.roomState);
+        this.notify();
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+          this.connectWebSocket(roomCode, this.currentPlayerId);
+        }
+        this.startPolling(roomCode);
+        return this.state;
+      }
+    } catch (err) {
+      console.warn("Error fetching room state:", err);
+    }
+    return null;
+  }
+
+  /**
+   * Initialize default presets in room
+   */
+  private async initDefaultPresets(): Promise<void> {
+    try {
+      const presets = await AudioClipManager.generatePresetClips();
+      await this.sendAction("SET_CLIPS", { clips: presets });
+    } catch (err) {
+      console.warn("Could not generate procedural presets immediately:", err);
+    }
+  }
+
+  /**
+   * Send game action to server
+   */
+  private async sendAction(actionType: string, payload: any): Promise<void> {
+    if (!this.state) return;
+    const roomCode = this.state.roomCode;
+
+    // Try WebSocket first
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(
+          JSON.stringify({
+            type: "ACTION",
+            roomCode,
+            playerId: this.currentPlayerId,
+            actionType,
+            payload,
+          })
+        );
+        return;
+      } catch (err) {
+        console.warn("WebSocket send failed, falling back to HTTP:", err);
+      }
+    }
+
+    // Fallback to HTTP POST
+    try {
+      const res = await fetch(`/api/rooms/${roomCode}/action`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          playerId: this.currentPlayerId,
+          actionType,
+          payload,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.roomState) {
+          this.state = normalizeRoomState(data.roomState);
+          this.notify();
+        }
+      }
+    } catch (err) {
+      console.error("HTTP action request error:", err);
+    }
+  }
+
+  /**
+   * WebSocket connection and management
+   */
+  private connectWebSocket(roomCode: string, playerId: string): void {
+    if (this.isConnecting || (this.ws && this.ws.readyState === WebSocket.OPEN)) {
+      return;
+    }
+
+    try {
+      this.isConnecting = true;
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${protocol}//${window.location.host}/ws`;
+
+      const ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        this.isConnecting = false;
+        this.ws = ws;
+        // Send JOIN message
+        ws.send(JSON.stringify({ type: "JOIN", roomCode, playerId }));
+
+        // Heartbeat ping
+        if (this.pingInterval) clearInterval(this.pingInterval);
+        this.pingInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "PING" }));
+          }
+        }, 15000);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "ROOM_STATE" && msg.state) {
+            this.state = normalizeRoomState(msg.state);
+            this.notify();
+          }
+        } catch (err) {
+          console.warn("Failed to parse WebSocket message:", err);
+        }
+      };
+
+      ws.onclose = () => {
+        this.isConnecting = false;
+        this.ws = null;
+        if (this.pingInterval) clearInterval(this.pingInterval);
+      };
+
+      ws.onerror = (err) => {
+        this.isConnecting = false;
+        console.warn("WebSocket error:", err);
+      };
+    } catch (err) {
+      this.isConnecting = false;
+      console.warn("Could not create WebSocket connection:", err);
+    }
+  }
+
+  private disconnectWebSocket(): void {
+    if (this.pingInterval) clearInterval(this.pingInterval);
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    this.isConnecting = false;
+  }
+
+  /**
+   * Polling fallback ensures continuous sync even if WS drops
+   */
+  private startPolling(roomCode: string): void {
+    this.stopPolling();
+    this.pollInterval = setInterval(async () => {
+      // If WebSocket is not open, poll via HTTP
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        await this.fetchState(roomCode);
+      }
+    }, 2000);
+  }
+
+  private stopPolling(): void {
+    if (this.pollInterval) {
+      clearInterval(this.pollInterval);
+      this.pollInterval = null;
+    }
+  }
+
+  // --- Game Action Methods ---
+
+  addClip(clip: AudioClip): void {
+    this.sendAction("ADD_CLIP", { clip });
   }
 
   removeClip(clipId: string): void {
-    this.state.clipPool = this.state.clipPool.filter((c) => c.id !== clipId);
-    this.notify();
+    this.sendAction("REMOVE_CLIP", { clipId });
   }
 
   async reloadPresets(): Promise<void> {
     const presets = await AudioClipManager.generatePresetClips();
-    // Keep user uploaded clips, append or refresh presets
-    const customClips = this.state.clipPool.filter((c) => !c.isPreset);
-    this.state.clipPool = [...customClips, ...presets];
-    this.notify();
+    const customClips = (this.state?.clipPool || []).filter((c) => !c.isPreset);
+    this.sendAction("SET_CLIPS", { clips: [...customClips, ...presets] });
   }
 
   clearAllClips(): void {
-    this.state.clipPool = [];
-    this.notify();
+    this.sendAction("CLEAR_CLIPS", {});
   }
 
-  /**
-   * Set scoring engine mode
-   */
   setScoringEngine(engine: "MEYDA_MFCC_DTW" | "GEMINI_MULTIMODAL"): void {
-    this.state.scoringEngine = engine;
-    this.notify();
+    this.sendAction("UPDATE_SETTINGS", { scoringEngine: engine });
   }
 
-  /**
-   * Set total rounds
-   */
   setTotalRounds(rounds: number): void {
-    this.state.currentRound.totalRounds = rounds;
-    this.notify();
+    this.sendAction("UPDATE_SETTINGS", { totalRounds: rounds });
   }
 
-  /**
-   * Update player profile
-   */
   updatePlayerProfile(playerId: string, name: string, avatar: string): void {
-    const player = this.state.players.find((p) => p.id === playerId);
-    if (player) {
-      player.name = name;
-      player.avatar = avatar;
-      this.notify();
-    }
+    this.sendAction("UPDATE_PROFILE", { name, avatar });
   }
 
-  /**
-   * Add a player or simulated party bot
-   */
-  addPlayer(name: string, avatar: string = "🎭"): Player {
-    const newPlayer: Player = {
-      id: "p_" + Math.random().toString(36).substring(2, 7),
-      name,
-      avatar,
-      isHost: false,
-      score: 0,
-      isReady: true,
-    };
-    this.state.players.push(newPlayer);
-    this.notify();
-    return newPlayer;
+  addPlayer(_name: string, _avatar: string = "🎭"): void {
+    this.sendAction("ADD_BOT", {});
   }
 
-  /**
-   * Remove a player
-   */
   removePlayer(playerId: string): void {
-    this.state.players = this.state.players.filter((p) => p.id !== playerId);
-    this.notify();
+    this.sendAction("REMOVE_PLAYER", { targetPlayerId: playerId });
   }
 
-  /**
-   * Reset game to Lobby
-   */
-  resetToLobby(): void {
-    this.stopTimer();
-    this.state.phase = "LOBBY";
-    this.state.players.forEach((p) => {
-      p.score = 0;
-      p.lastRoundScore = undefined;
-      p.assignedClip = undefined;
-      p.turnSubmission = undefined;
-    });
-    this.state.currentRound = {
-      roundNumber: 1,
-      totalRounds: this.state.currentRound.totalRounds || 3,
-      activePlayerIndex: 0,
-      turnSubmissions: {},
-    };
-    this.notify();
+  startGame(): void {
+    this.sendAction("START_GAME", {});
   }
 
-  /**
-   * Start Game:
-   * 1. Ensure clip pool is ready.
-   * 2. Randomize/shuffle audio clips and assign one to each player!
-   * 3. Set activePlayerIndex to 0 and transition to TURN_MIMIC.
-   */
-  async startGame(): Promise<void> {
-    this.stopTimer();
-
-    // Ensure we have clips
-    if (this.state.clipPool.length === 0) {
-      await this.reloadPresets();
-    }
-
-    this.assignRandomizedClips();
-
-    this.state.currentRound.roundNumber = 1;
-    this.state.currentRound.activePlayerIndex = 0;
-    this.state.currentRound.turnSubmissions = {};
-    this.state.phase = "TURN_MIMIC";
-
-    this.startTimer(45, () => {
-      // Time's up fallback handled in view
-    });
-    this.notify();
-  }
-
-  /**
-   * Helper: Shuffle clip pool and assign a randomized clip to every player
-   */
-  private assignRandomizedClips(): void {
-    const pool = [...this.state.clipPool];
-    if (pool.length === 0) return;
-
-    // Fisher-Yates shuffle
-    for (let i = pool.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [pool[i], pool[j]] = [pool[j], pool[i]];
-    }
-
-    this.state.players.forEach((player, idx) => {
-      player.assignedClip = pool[idx % pool.length];
-      player.turnSubmission = undefined;
-    });
-  }
-
-  /**
-   * Submit Active Player Mimic:
-   * Evaluates similarity against the active player's assigned randomized clip,
-   * updates points, and moves to TURN_SCORE.
-   */
   async submitActivePlayerMimic(recording: AudioRecording): Promise<void> {
-    this.stopTimer();
+    if (!this.state) return;
     const activePlayer = this.state.players[this.state.currentRound.activePlayerIndex];
-    if (!activePlayer || !activePlayer.assignedClip) {
-      console.error("No active player or assigned clip found!");
-      return;
-    }
+    if (!activePlayer || !activePlayer.assignedClip) return;
 
-    const targetClip = activePlayer.assignedClip;
+    let result: SimilarityResult | undefined;
 
-    let result: SimilarityResult;
-    try {
-      if (this.state.scoringEngine === "MEYDA_MFCC_DTW") {
-        result = await AudioComparer.compareWithMeyda(targetClip, recording);
-      } else {
-        result = await AudioComparer.compareWithGemini(targetClip, recording);
+    // If using client-side Meyda MFCC, compute it immediately on client
+    if (this.state.scoringEngine === "MEYDA_MFCC_DTW") {
+      try {
+        result = await AudioComparer.compareWithMeyda(activePlayer.assignedClip, recording);
+      } catch (err) {
+        console.warn("Client Meyda comparison error:", err);
       }
-    } catch (err) {
-      console.error("Score evaluation error:", err);
-      result = {
-        score: 65,
-        critique: "A spirited vocal rendition! Tone and acoustic cadence matched with gusto.",
-        method: this.state.scoringEngine === "MEYDA_MFCC_DTW" ? "MEYDA_MFCC_DTW" : "GEMINI_MULTIMODAL",
-      };
     }
 
-    const submission: TurnSubmission = {
-      playerId: activePlayer.id,
-      playerName: activePlayer.name,
-      targetClip,
-      mimicRecording: recording,
+    // Send mimic recording and optional client result to server
+    await this.sendAction("SUBMIT_MIMIC", {
+      recording: {
+        base64: recording.base64,
+        mimeType: recording.mimeType,
+        durationSeconds: recording.durationSeconds,
+        url: recording.url,
+        waveformSamples: recording.waveformSamples,
+      },
       result,
-    };
-
-    activePlayer.turnSubmission = submission;
-    activePlayer.lastRoundScore = result.score;
-    activePlayer.score += result.score;
-    this.state.currentRound.turnSubmissions[activePlayer.id] = submission;
-
-    this.state.phase = "TURN_SCORE";
-    this.notify();
+    });
   }
 
-  /**
-   * Advance to the next player's turn OR to ROUND_SUMMARY if everyone has mimicked
-   */
   advanceNextTurn(): void {
-    this.stopTimer();
-    const nextIndex = this.state.currentRound.activePlayerIndex + 1;
-
-    if (nextIndex < this.state.players.length) {
-      // Next player's turn
-      this.state.currentRound.activePlayerIndex = nextIndex;
-      this.state.phase = "TURN_MIMIC";
-      this.startTimer(45, () => {});
-    } else {
-      // All players have taken their turns in this round!
-      this.state.phase = "ROUND_SUMMARY";
-      this.state.players.sort((a, b) => b.score - a.score);
-    }
-    this.notify();
+    this.sendAction("ADVANCE_TURN", {});
   }
 
-  /**
-   * Next Round or Final Game Over
-   */
   nextRound(): void {
-    const { roundNumber, totalRounds } = this.state.currentRound;
-    if (roundNumber >= totalRounds) {
-      this.state.phase = "GAME_OVER";
-      this.notify();
-      return;
-    }
-
-    // Re-shuffle clips and assign new randomized clips to each player for the next round!
-    this.assignRandomizedClips();
-    this.state.currentRound.roundNumber = roundNumber + 1;
-    this.state.currentRound.activePlayerIndex = 0;
-    this.state.currentRound.turnSubmissions = {};
-    this.state.phase = "TURN_MIMIC";
-    this.startTimer(45, () => {});
-    this.notify();
+    this.sendAction("NEXT_ROUND", {});
   }
 
-  /**
-   * Timer management
-   */
-  private startTimer(seconds: number, onExpire: () => void): void {
-    this.stopTimer();
-    this.state.timerRemaining = seconds;
-    this.state.isTimerActive = true;
-    this.notify();
-
-    this.timerInterval = setInterval(() => {
-      this.state.timerRemaining -= 1;
-      if (this.state.timerRemaining <= 0) {
-        this.stopTimer();
-        onExpire();
-      }
-      this.notify();
-    }, 1000);
-  }
-
-  private stopTimer(): void {
-    if (this.timerInterval) {
-      clearInterval(this.timerInterval);
-      this.timerInterval = null;
-    }
-    this.state.isTimerActive = false;
+  resetToLobby(): void {
+    this.sendAction("RESET_LOBBY", {});
   }
 }

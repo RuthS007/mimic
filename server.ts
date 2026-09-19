@@ -1,8 +1,11 @@
 import express from "express";
+import http from "http";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
+import { WebSocket, WebSocketServer } from "ws";
 import dotenv from "dotenv";
+import { RoomManager } from "./server/rooms";
 
 dotenv.config();
 
@@ -31,6 +34,8 @@ function getGeminiClient(): GoogleGenAI | null {
   return aiClient;
 }
 
+const roomManager = new RoomManager(getGeminiClient);
+
 // Health check endpoint
 app.get("/api/health", (_req, res) => {
   res.json({
@@ -38,6 +43,73 @@ app.get("/api/health", (_req, res) => {
     hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
     timestamp: new Date().toISOString(),
   });
+});
+
+// Room Creation API
+app.post("/api/rooms/create", (req, res) => {
+  try {
+    const { hostName, hostAvatar } = req.body || {};
+    const { roomState, hostPlayer } = roomManager.createRoom(
+      hostName || "Host Player",
+      hostAvatar || "🎙️"
+    );
+    res.json({ roomState, player: hostPlayer });
+  } catch (err: any) {
+    console.error("Error creating room:", err);
+    res.status(500).json({ error: "Failed to create room" });
+  }
+});
+
+// Room Join API
+app.post("/api/rooms/join", (req, res) => {
+  try {
+    const { roomCode, playerName, avatar, playerId } = req.body || {};
+    if (!roomCode) {
+      return res.status(400).json({ error: "Room code is required" });
+    }
+
+    const result = roomManager.joinRoom(roomCode, playerName, avatar, playerId);
+    if ("error" in result) {
+      return res.status(404).json({ error: result.error });
+    }
+
+    res.json(result);
+  } catch (err: any) {
+    console.error("Error joining room:", err);
+    res.status(500).json({ error: "Failed to join room" });
+  }
+});
+
+// Get Room State API
+app.get("/api/rooms/:roomCode/state", (req, res) => {
+  const { roomCode } = req.params;
+  const room = roomManager.getRoom(roomCode);
+  if (!room) {
+    return res.status(404).json({ error: `Room ${roomCode} not found` });
+  }
+  res.json({ roomState: room });
+});
+
+// Post Room Action API
+app.post("/api/rooms/:roomCode/action", async (req, res) => {
+  try {
+    const { roomCode } = req.params;
+    const { playerId, actionType, payload } = req.body || {};
+
+    if (!actionType) {
+      return res.status(400).json({ error: "actionType is required" });
+    }
+
+    const result = await roomManager.handleAction(roomCode, playerId, actionType, payload);
+    if ("error" in result) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    res.json({ roomState: result });
+  } catch (err: any) {
+    console.error("Error handling room action:", err);
+    res.status(500).json({ error: "Failed to perform action" });
+  }
 });
 
 // Audio Comparison API (Option B: Multimodal Gemini LLM)
@@ -155,6 +227,62 @@ Write a witty, punchy, funny 1-2 sentence critique that directly roasts or prais
 });
 
 async function startServer() {
+  const server = http.createServer(app);
+  const wss = new WebSocketServer({ server, path: "/ws" });
+
+  wss.on("connection", (ws: WebSocket, req) => {
+    // Keep alive ping-pong
+    (ws as any).isAlive = true;
+    ws.on("pong", () => {
+      (ws as any).isAlive = true;
+    });
+
+    ws.on("message", async (data: string) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "JOIN") {
+          const { roomCode, playerId } = msg;
+          if (roomCode && playerId) {
+            roomManager.registerSocket(roomCode, playerId, ws);
+          }
+        } else if (msg.type === "ACTION") {
+          const { roomCode, playerId, actionType, payload } = msg;
+          if (roomCode && actionType) {
+            await roomManager.handleAction(roomCode, playerId, actionType, payload);
+          }
+        } else if (msg.type === "PING") {
+          ws.send(JSON.stringify({ type: "PONG" }));
+        }
+      } catch (err) {
+        console.warn("Error parsing WebSocket message:", err);
+      }
+    });
+
+    ws.on("close", () => {
+      roomManager.unregisterSocket(ws);
+    });
+
+    ws.on("error", (err) => {
+      console.warn("WebSocket client error:", err);
+      roomManager.unregisterSocket(ws);
+    });
+  });
+
+  // Heartbeat interval for stale connection cleanup
+  const heartbeat = setInterval(() => {
+    wss.clients.forEach((ws: any) => {
+      if (!ws.isAlive) {
+        return ws.terminate();
+      }
+      ws.isAlive = false;
+      ws.ping();
+    });
+  }, 30000);
+
+  wss.on("close", () => {
+    clearInterval(heartbeat);
+  });
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -169,7 +297,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  server.listen(PORT, "0.0.0.0", () => {
     console.log(`Echo Match server running on http://0.0.0.0:${PORT}`);
   });
 }

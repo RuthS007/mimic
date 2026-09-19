@@ -32,7 +32,8 @@ export const TurnMimicView: React.FC<TurnMimicViewProps> = ({
   const { roundNumber, totalRounds, activePlayerIndex } = roomState.currentRound;
   const activePlayer = roomState.players[activePlayerIndex];
   const isMyTurn = activePlayer?.id === currentPlayerId;
-  const isBot = !activePlayer?.isHost && activePlayer?.id !== currentPlayerId;
+  const isBot = Boolean(activePlayer?.id?.startsWith("p_bot_"));
+  const isHostClient = Boolean(roomState.players.find((p) => p.id === currentPlayerId)?.isHost);
 
   const targetClip = activePlayer?.assignedClip;
 
@@ -44,19 +45,19 @@ export const TurnMimicView: React.FC<TurnMimicViewProps> = ({
 
   const audioRecorderRef = useRef<AudioRecorder | null>(null);
 
-  // Auto-play bot turns with brief simulated delay
+  // Auto-play bot turns with brief simulated delay (only executed by the host to prevent double submissions)
   useEffect(() => {
     setRecordedMimic(null);
     setIsRecording(false);
     setIsEvaluating(false);
 
-    if (isBot && targetClip) {
+    if (isBot && isHostClient && targetClip) {
       const timer = setTimeout(() => {
         handleBotSimulatedMimic();
       }, 2400);
       return () => clearTimeout(timer);
     }
-  }, [activePlayerIndex, isBot]);
+  }, [activePlayerIndex, isBot, isHostClient]);
 
   const startRecording = async () => {
     setRecordedMimic(null);
